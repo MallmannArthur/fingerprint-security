@@ -1,7 +1,9 @@
 #include <Adafruit_Fingerprint.h>
-#include <SoftwareSerial.h>
+//#include <SoftwareSerial.h>
+#include <AltSoftSerial.h>
+//SoftwareSerial mySensorSerial(2, 3); // RX, TX (Sensor TX -> D2, Sensor RX <- D3)
+AltSoftSerial mySensorSerial;   // RX, TX (Sensor TX -> D8, Sensor RX <- D9)
 
-SoftwareSerial mySensorSerial(2, 3); // RX, TX (Sensor TX -> D2, Sensor RX <- D3 via divisor)
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySensorSerial);
 
 String inputString = "";      // String para armazenar dados recebidos
@@ -447,6 +449,231 @@ void handleFingerprintError(int errorCode, const String& context) {
   sendResponse(errorMsg);
 }
 
+void handleTemplateDownload5(uint8_t bufferId_to_upload_from) {
+    uint8_t p = finger.getModel();
+    if (p != FINGERPRINT_OK) {
+        sendResponse(String(RESP_FAIL) + F(":GETMODEL_CMD_FAIL_CODE_0x") + String(p, HEX));
+        return;
+    }
+    sendResponse(String(RESP_OK) + F(":TEMPLATE_UPLOAD_CMD_ACKNOWLEDGED_RAW_DUMP_SLOW_MODE")); // Nome diferente
+
+    unsigned long startTime = millis();
+    int bytesDumped = 0;
+    const int MAX_DUMP_BYTES = 200; // Reduzido para este teste, para não demorar demais
+    const unsigned long DUMP_TIMEOUT = 10000; // Aumentar timeout geral devido aos delays
+
+    Serial.print(START_MARKER); Serial.print(RESP_PREFIX);
+    Serial.print(F("RAW_DUMP_SLOW:")); 
+
+    while (bytesDumped < MAX_DUMP_BYTES && (millis() - startTime < DUMP_TIMEOUT)) {
+        if (mySensorSerial.available()) {
+            uint8_t b = mySensorSerial.read();
+            if (b < 0x10) Serial.print('0');
+            Serial.print(b, HEX);
+            bytesDumped++;
+            delay(5); // <<< ADICIONA UM PEQUENO DELAY APÓS CADA BYTE LIDO DO SENSOR
+        }
+        // Se não houver nada disponível, o loop continua rapidamente,
+        // mas se houver, o delay(5) acontece.
+    }
+    Serial.print(END_MARKER); Serial.print('\n'); Serial.flush();
+
+    if (bytesDumped > 0) {
+        sendResponse(String(RESP_OK) + F(":RAW_DUMP_SLOW_COMPLETE:") + String(bytesDumped));
+    } else {
+        sendResponse(String(RESP_FAIL) + F(":RAW_DUMP_SLOW_NO_DATA_OR_TIMEOUT"));
+    }
+    
+    unsigned long cleanupStartTime = millis();
+    while(mySensorSerial.available() && (millis()-cleanupStartTime < 200)) {
+        mySensorSerial.read();
+        delay(1); 
+    }
+}
+
+void handleTemplateDownload4(uint8_t bufferId_to_upload_from) {
+    uint8_t p = finger.getModel(); // Envia UpChar para CharBuffer1
+    if (p != FINGERPRINT_OK) {
+        sendResponse(String(RESP_FAIL) + F(":GETMODEL_CMD_FAIL_CODE_0x") + String(p, HEX));
+        return;
+    }
+    // Sensor respondeu OK e VAI começar a enviar pacotes de dados.
+    sendResponse(String(RESP_OK) + F(":TEMPLATE_UPLOAD_CMD_ACKNOWLEDGED_RAW_DUMP_MODE"));
+
+    unsigned long startTime = millis();
+    int bytesDumped = 0;
+    // Vamos tentar dumpar um pouco mais que o tamanho de um template,
+    // para pegar múltiplos pacotes se eles vierem rapidamente.
+    // Ex: 4 pacotes de (9 header + 128 payload + 2 checksum = 139 bytes) = 556 bytes.
+    // Vamos dumpar uns 600 bytes ou por um timeout de alguns segundos.
+    const int MAX_DUMP_BYTES = 600; 
+    const unsigned long DUMP_TIMEOUT = 5000; // 5 segundos
+
+    Serial.print(START_MARKER); Serial.print(RESP_PREFIX);
+    Serial.print(F("RAW_DUMP:")); // Nova mensagem para o Python identificar
+
+    while (bytesDumped < MAX_DUMP_BYTES && (millis() - startTime < DUMP_TIMEOUT)) {
+        if (mySensorSerial.available()) {
+            uint8_t b = mySensorSerial.read();
+            if (b < 0x10) Serial.print('0');
+            Serial.print(b, HEX);
+            bytesDumped++;
+        }
+        // Não coloque delay aqui dentro para tentar capturar o fluxo o mais rápido possível
+    }
+    Serial.print(END_MARKER); Serial.print('\n'); Serial.flush();
+
+    if (bytesDumped > 0) {
+        sendResponse(String(RESP_OK) + F(":RAW_DUMP_COMPLETE:") + String(bytesDumped));
+    } else {
+        sendResponse(String(RESP_FAIL) + F(":RAW_DUMP_NO_DATA_OR_TIMEOUT"));
+    }
+    
+    // Limpar qualquer lixo restante na serial do sensor
+    // É importante fazer isso APÓS o dump para não interferir
+    unsigned long cleanupStartTime = millis();
+    while(mySensorSerial.available() && (millis()-cleanupStartTime < 200)) {
+        mySensorSerial.read();
+        delay(1); // Pequena pausa para permitir que mais chegue e seja limpo
+    }
+}
+
+
+void handleTemplateDownload3(uint8_t bufferId_to_upload_from) {
+    uint8_t p = finger.getModel();
+    if (p != FINGERPRINT_OK) {
+        sendResponse(String(RESP_FAIL) + F(":GETMODEL_CMD_FAIL_CODE_0x") + String(p, HEX));
+        return;
+    }
+    sendResponse(String(RESP_OK) + F(":TEMPLATE_UPLOAD_CMD_ACKNOWLEDGED"));
+
+    // Buffer para o pacote INTEIRO do sensor (máximo: 9 header + 128 payload + 2 checksum = 139)
+    // O manual diz que o payload máximo pode ser 256, então: 9 + 256 + 2 = 267.
+    // Vamos usar um buffer um pouco maior para segurança, mas DATA_PACKET_PAYLOAD_SIZE ainda é 128 por padrão.
+    // Se o sensor for configurado para pacotes de 256, DATA_PACKET_PAYLOAD_SIZE precisa mudar.
+    uint8_t sensorFullPacket[DATA_PACKET_PAYLOAD_SIZE + 12]; // Ajuste se payload for > 128
+
+    int totalTemplateBytesReceived = 0;
+    bool downloadError = false;
+
+    while (totalTemplateBytesReceived < TEMPLATE_SIZE && !downloadError) {
+        unsigned long packetStartTime = millis();
+        int bytesToRead; // Quantos bytes esperamos para este pacote completo
+        int headerBytesRead = 0;
+        uint8_t header[9];
+
+        // 1. Ler o cabeçalho para determinar o tamanho total do pacote
+        while(headerBytesRead < 9 && (millis() - packetStartTime < 500)) {
+            if (mySensorSerial.available()) {
+                header[headerBytesRead++] = mySensorSerial.read();
+            }
+        }
+        if (headerBytesRead < 9) {
+            sendResponse(String(RESP_FAIL) + F(":TIMEOUT_READING_PACKET_HEADER"));
+            downloadError = true; break;
+        }
+
+        if (header[0] != (FINGERPRINT_STARTCODE >> 8) || header[1] != (FINGERPRINT_STARTCODE & 0xFF)) {
+            sendResponse(String(RESP_FAIL) + F(":BAD_TEMPLATE_PACKET_START_CODE"));
+            downloadError = true; break;
+        }
+        uint8_t pid = header[6];
+        uint16_t packetLengthField = (header[7] << 8) | header[8]; // Este é o CAMPO "Packet Length"
+
+        if (pid != ZFM_PID_DATA && pid != ZFM_PID_ENDDATA) {
+            sendResponse(String(RESP_FAIL) + F(":UNEXPECTED_PID_0x") + String(pid, HEX));
+            downloadError = true; break;
+        }
+
+        // packetLengthField inclui payload + 2 bytes de checksum.
+        // Total de bytes a ler para o resto do pacote = packetLengthField.
+        bytesToRead = packetLengthField; 
+        uint16_t payloadLength = packetLengthField - 2;
+
+        if (payloadLength > DATA_PACKET_PAYLOAD_SIZE || payloadLength == 0 || payloadLength > TEMPLATE_SIZE) {
+            sendResponse(String(RESP_FAIL) + F(":INVALID_PAYLOAD_LENGTH_") + String(payloadLength));
+            downloadError = true; break;
+        }
+        
+        // 2. Ler o resto do pacote (payload + checksum) para sensorFullPacket
+        int remainingBytesRead = 0;
+        packetStartTime = millis(); // Reset timeout
+        while(remainingBytesRead < bytesToRead && (millis() - packetStartTime < 1500)) { // Timeout maior para payload+checksum
+            if (mySensorSerial.available()) {
+                sensorFullPacket[remainingBytesRead++] = mySensorSerial.read();
+            }
+        }
+
+        if (remainingBytesRead < bytesToRead) {
+            sendResponse(String(RESP_FAIL) + F(":TIMEOUT_READING_PACKET_DATA_OR_CHECKSUM_READ_") + String(remainingBytesRead) + F("_EXPECTED_") + String(bytesToRead));
+            downloadError = true; // break;
+
+        }
+
+        // Agora, sensorFullPacket[0 ... payloadLength-1] é o payload
+        // sensorFullPacket[payloadLength] e sensorFullPacket[payloadLength+1] são o checksum
+        if (!downloadError) { // Só prossiga se não houve timeout na leitura do payload E checksum
+            // 3. Calcular Checksum
+            uint16_t calculatedChecksum = pid + header[7] + header[8]; // PID + Len_H + Len_L
+            for (int i = 0; i < payloadLength; i++) {
+                calculatedChecksum += sensorFullPacket[i]; // Soma bytes do payload
+            }
+            
+            // Extrai o checksum do sensor DO FINAL do sensorFullPacket
+            // sensorFullPacket agora contém [payload bytes ... checksum_High_Byte, checksum_Low_Byte]
+            // E remainingBytesRead deve ser igual a payloadLength + 2
+            uint16_t sensorChecksum = (sensorFullPacket[payloadLength] << 8) | sensorFullPacket[payloadLength+1];
+
+                // --- DEBUG PARA PYTHON ---
+                String debugMsg = String(F("DBG:PayL=")); 
+                debugMsg += String(payloadLength);
+                debugMsg += String(F(",PID=0x")) + String(pid, HEX);
+                debugMsg += String(F(",PktL(field)=0x")) + String(packetLengthField, HEX); // O valor do campo length
+                debugMsg += String(F(",CalcSum=0x")) + String(calculatedChecksum, HEX);
+                debugMsg += String(F(",SensSum=0x")) + String(sensorChecksum, HEX);
+                sendResponse(debugMsg); 
+                // --- FIM DEBUG ---
+
+            if (calculatedChecksum != sensorChecksum) {
+                sendResponse(String(RESP_FAIL) + F(":TEMPLATE_CHUNK_CHECKSUM_MISMATCH"));
+                downloadError = true; // break;
+            }  else {
+              // Checksum OK! Enviar o payload para o Python
+              Serial.print(START_MARKER); Serial.print(RESP_PREFIX);
+              Serial.print(F("TEMPLATE_CHUNK:"));
+              for (int i = 0; i < payloadLength; i++) {
+                  if (sensorFullPacket[i] < 0x10) Serial.print('0');
+                  Serial.print(sensorFullPacket[i], HEX);
+              }
+              Serial.print(END_MARKER); Serial.print('\n'); Serial.flush();
+              
+              totalTemplateBytesReceived += payloadLength;
+
+              if (pid == ZFM_PID_ENDDATA) { // Este era o último pacote
+                  if (totalTemplateBytesReceived != TEMPLATE_SIZE) {
+                      // Este erro só deve acontecer se o último pacote tiver um payloadLength inesperado
+                      sendResponse(String(RESP_FAIL) + F(":END_PACKET_BUT_SIZE_MISMATCH_RECV_") + String(totalTemplateBytesReceived));
+                      downloadError = true;
+                  }
+                  // Não precisa de 'break' aqui, o loop while vai terminar naturalmente
+                  // porque totalTemplateBytesReceived >= TEMPLATE_SIZE ou downloadError é true.
+              }
+            }
+        } // Fim do if (!downloadError) após a leitura do pacote
+        if (downloadError) break;
+    } // Fim do while
+
+    if (!downloadError && totalTemplateBytesReceived == TEMPLATE_SIZE) {
+        sendResponse(String(RESP_OK) + F(":TEMPLATE_DOWNLOAD_COMPLETE:") + String(totalTemplateBytesReceived));
+    } else if (!downloadError && totalTemplateBytesReceived != TEMPLATE_SIZE) {
+        sendResponse(String(RESP_FAIL) + F(":DOWNLOAD_INCOMPLETE_OR_SIZE_MISMATCH_RECV_") + String(totalTemplateBytesReceived));
+    }
+    
+    delay(50); 
+    while(mySensorSerial.available()) mySensorSerial.read();
+}
+
+
 void handleTemplateDownload(uint8_t bufferId_to_upload_from) { // bufferId pode ser 0x01 ou 0x02
     // Serial.println(F("Arduino: Solicitando upload de template do sensor..."));
 
@@ -466,114 +693,127 @@ void handleTemplateDownload(uint8_t bufferId_to_upload_from) { // bufferId pode 
     int totalTemplateBytesReceived = 0;
     bool downloadError = false;
 
-    while (totalTemplateBytesReceived < TEMPLATE_SIZE && !downloadError) {
-        unsigned long packetStartTime = millis();
-        int availableBytes;
-        // Esperar por dados suficientes para pelo menos o cabeçalho de um pacote (9 bytes)
-        do {
-            availableBytes = mySensorSerial.available();
-            if (millis() - packetStartTime > 2000) { // Timeout para esperar o início de um pacote
-                sendResponse(String(RESP_FAIL) + F(":TIMEOUT_WAITING_SENSOR_DATA_PACKET"));
-                downloadError = true;
-                break;
-            }
-            delay(1);
-        } while (availableBytes < 9);
+  while (totalTemplateBytesReceived < TEMPLATE_SIZE && !downloadError) {
+          unsigned long packetStartTime = millis();
+          
+          // --- Etapa 1: Ler o cabeçalho do pacote (9 bytes) ---
+          uint8_t header[9];
+          int bytesRead = 0;
+          while(bytesRead < 9 && (millis() - packetStartTime < 500)) { // Timeout para cabeçalho
+              if (mySensorSerial.available()) {
+                  header[bytesRead++] = mySensorSerial.read();
+              }
+          }
+          if (bytesRead < 9) {
+              sendResponse(String(RESP_FAIL) + F(":TIMEOUT_READING_PACKET_HEADER"));
+              downloadError = true; break;
+          }
 
-        if (downloadError) break;
+          if (header[0] != (FINGERPRINT_STARTCODE >> 8) || header[1] != (FINGERPRINT_STARTCODE & 0xFF)) {
+              sendResponse(String(RESP_FAIL) + F(":BAD_TEMPLATE_PACKET_START_CODE"));
+              downloadError = true; break;
+          }
+          // header[2] a header[5] são o endereço (ignorar)
+          uint8_t pid = header[6];
+          uint16_t packetLength = (header[7] << 8) | header[8];
 
-        // Ler e validar o cabeçalho do pacote do sensor
-        if ((uint8_t)mySensorSerial.read() != (FINGERPRINT_STARTCODE >> 8) ||
-            (uint8_t)mySensorSerial.read() != (FINGERPRINT_STARTCODE & 0xFF)) {
-            sendResponse(String(RESP_FAIL) + F(":BAD_TEMPLATE_PACKET_START_CODE"));
-            downloadError = true; break;
-        }
-        // Ler endereço (4 bytes) - vamos apenas consumir
-        for (int i = 0; i < 4; i++) { mySensorSerial.read(); }
+          if (pid != ZFM_PID_DATA && pid != ZFM_PID_ENDDATA) {
+              sendResponse(String(RESP_FAIL) + F(":UNEXPECTED_PID_0x") + String(pid, HEX));
+              downloadError = true; break;
+          }
 
-        uint8_t pid = (uint8_t)mySensorSerial.read();
-        uint16_t packetLength = ((uint8_t)mySensorSerial.read()) << 8;
-        packetLength |= (uint8_t)mySensorSerial.read();
+          uint16_t payloadLength = packetLength - 2; // -2 para o checksum
+          if (payloadLength > DATA_PACKET_PAYLOAD_SIZE || payloadLength == 0 || payloadLength > TEMPLATE_SIZE) { // Checagem extra
+              sendResponse(String(RESP_FAIL) + F(":INVALID_PAYLOAD_LENGTH_") + String(payloadLength));
+              downloadError = true; break;
+          }
 
-        if (pid != ZFM_PID_DATA && pid != ZFM_PID_ENDDATA) {
-            sendResponse(String(RESP_FAIL) + F(":UNEXPECTED_PID_0x") + String(pid, HEX));
-            downloadError = true; break;
-        }
+          // --- Etapa 2: Ler o Payload (payloadLength bytes) ---
+          Serial.print(START_MARKER); Serial.print(RESP_PREFIX);
+          Serial.print(F("TEMPLATE_CHUNK:"));
 
-        // packetLength = N (payload) + 2 (checksum)
-        uint16_t payloadLength = packetLength - 2;
-        if (payloadLength > DATA_PACKET_PAYLOAD_SIZE || payloadLength == 0) {
-            sendResponse(String(RESP_FAIL) + F(":INVALID_PAYLOAD_LENGTH_") + String(payloadLength));
-            downloadError = true; break;
-        }
+          uint16_t calculatedChecksum = pid + header[7] + header[8]; // Soma PID + high(len) + low(len)
+          
+          uint8_t payloadBuffer[DATA_PACKET_PAYLOAD_SIZE]; // Temporário para debug e checksum
+          bytesRead = 0;
+          packetStartTime = millis(); // Resetar timeout para o payload
+          while(bytesRead < payloadLength && (millis() - packetStartTime < 1000)) { // Timeout para todo o payload
+              if (mySensorSerial.available()) {
+                  uint8_t templateByte = mySensorSerial.read();
+                  payloadBuffer[bytesRead++] = templateByte; // Guarda para debug, se necessário
+                  
+                  if (templateByte < 0x10) Serial.print('0');
+                  Serial.print(templateByte, HEX);
+                  calculatedChecksum += templateByte;
+              }
+          }
+          Serial.print(END_MARKER); Serial.print('\n'); Serial.flush();
 
-        // Envia para o Python APENAS os dados do template em formato hexadecimal
-        Serial.print(START_MARKER); Serial.print(RESP_PREFIX);
-        Serial.print(F("TEMPLATE_CHUNK:"));
+          if (bytesRead < payloadLength) {
+              sendResponse(String(RESP_FAIL) + F(":TIMEOUT_READING_PAYLOAD_DATA"));
+              downloadError = true; break;
+          }
+          totalTemplateBytesReceived += payloadLength;
 
-        uint16_t calculatedChecksum = pid + (packetLength >> 8) + (packetLength & 0xFF);
+          // --- Etapa 3: Ler o Checksum do Sensor (2 bytes) ---
+          uint8_t checksumBytes[2];
+          bytesRead = 0;
+          packetStartTime = millis(); // Resetar timeout para o checksum
+          while(bytesRead < 2 ){//&& (millis() - packetStartTime < 300)) { // Timeout para checksum
+              if (mySensorSerial.available()) {
+                  checksumBytes[bytesRead++] = mySensorSerial.read();
+              }
+          }
+          if (bytesRead < 2) {
+              sendResponse(String(RESP_FAIL) + F(":TIMEOUT_READING_SENSOR_CHECKSUM"));
+              downloadError = true; break;
+          }
+          uint16_t sensorChecksum = (checksumBytes[0] << 8) | checksumBytes[1];
 
-        for (int i = 0; i < payloadLength; i++) {
-            unsigned long byteReadStartTime = millis();
-            while (!mySensorSerial.available()) {
-                if (millis() - byteReadStartTime > 100) { // Timeout para um byte individual
-                    sendResponse(String(RESP_FAIL) + F(":TIMEOUT_READING_PAYLOAD_BYTE"));
-                    downloadError = true; break;
-                }
-                delay(1);
-            }
-            if (downloadError) break;
+          // --- DEBUG PARA VOCÊ (via Python) ---
+          String debugMsg = String(F("DBG:PayL=")); // Inicia debugMsg já como String a partir de F()
+          debugMsg += String(payloadLength);
+          debugMsg += String(F(",PID=0x")) + String(pid, HEX);
+          debugMsg += String(F(",PktL(raw)=0x")) + String(packetLength, HEX);
+          debugMsg += String(F(",CalcSum=0x") )+ String(calculatedChecksum, HEX);
+          debugMsg += String(F(",SensSum=0x")) + String(sensorChecksum, HEX);
+          sendResponse(debugMsg); 
+          // --- FIM DEBUG ---
 
-            uint8_t templateByte = (uint8_t)mySensorSerial.read();
-            if (templateByte < 0x10) Serial.print('0');
-            Serial.print(templateByte, HEX);
-            calculatedChecksum += templateByte;
-        }
-        if (downloadError) { // Se erro ao ler payload, fechar a tag e sair
-            Serial.print(END_MARKER); Serial.print('\n'); Serial.flush();
-            break;
-        }
+          if (calculatedChecksum != sensorChecksum) {
+              sendResponse(String(RESP_FAIL) + F(":TEMPLATE_CHUNK_CHECKSUM_MISMATCH"));
+              downloadError = true; break;
+          }
 
-        Serial.print(END_MARKER); Serial.print('\n'); Serial.flush();
-        totalTemplateBytesReceived += payloadLength;
-
-        // Ler checksum do sensor (2 bytes)
-        uint16_t sensorChecksum;
-        unsigned long chkReadStartTime = millis();
-        while(mySensorSerial.available() < 2) {
-            if (millis() - chkReadStartTime > 100) {
-                 sendResponse(String(RESP_FAIL) + F(":TIMEOUT_READING_CHECKSUM"));
-                 downloadError = true; break;
-            }
-            delay(1);
-        }
-        if (downloadError) break;
-        
-        sensorChecksum = ((uint8_t)mySensorSerial.read()) << 8;
-        sensorChecksum |= (uint8_t)mySensorSerial.read();
-
-        if (calculatedChecksum != sensorChecksum) {
-            sendResponse(String(RESP_FAIL) + F(":TEMPLATE_CHUNK_CHECKSUM_MISMATCH"));
-            downloadError = true; break;
-        }
-
-        if (pid == ZFM_PID_ENDDATA) {
-            if (totalTemplateBytesReceived != TEMPLATE_SIZE) {
-                sendResponse(String(RESP_FAIL) + F(":END_PACKET_BUT_SIZE_MISMATCH_RECV_") + String(totalTemplateBytesReceived));
-                downloadError = true;
-            }
-            break; // Fim da transmissão
-        }
-    } // Fim do while (totalTemplateBytesReceived < TEMPLATE_SIZE && !downloadError)
+          if (pid == ZFM_PID_ENDDATA) {
+              // ... (lógica de verificação do tamanho total) ...
+              break; 
+          }
+      } // Fim do while (totalTemplateBytesReceived < TEMPLATE_SIZE && !downloadError)
 
     if (!downloadError && totalTemplateBytesReceived == TEMPLATE_SIZE) {
         sendResponse(String(RESP_OK) + F(":TEMPLATE_DOWNLOAD_COMPLETE:") + String(totalTemplateBytesReceived));
-    } else if (!downloadError && totalTemplateBytesReceived != TEMPLATE_SIZE) {
-        // Chegou aqui se o loop terminou por timeout antes de receber todos os bytes, mas sem erro de checksum/pacote
-        sendResponse(String(RESP_FAIL) + F(":DOWNLOAD_INCOMPLETE_TIMEOUT_RECV_") + String(totalTemplateBytesReceived));
+    } else if (!downloadError && totalTemplateBytesReceived != TEMPLATE_SIZE && totalTemplateBytesReceived > 0) {
+        // Chegou aqui se o loop terminou por timeout/condição antes de receber todos os bytes,
+        // mas os pacotes que foram recebidos tiveram checksum OK.
+        sendResponse(String(RESP_FAIL) + F(":DOWNLOAD_INCOMPLETE_EXPECTED_") + String(TEMPLATE_SIZE) + F("_GOT_") + String(totalTemplateBytesReceived));
+    //} else if (downloadError) {
+      // Se downloadError foi true, a mensagem de erro específica já foi enviada.
+    } else if (totalTemplateBytesReceived == 0 && !downloadError) {
+      // Caso especial: nenhum byte de template foi recebido, mas nenhum erro explícito ocorreu
+      // (Pode acontecer se o getModel falhar e não for tratado antes, ou timeout antes do primeiro pacote)
+      sendResponse(String(RESP_FAIL) + F(":DOWNLOAD_NO_TEMPLATE_BYTES_RECEIVED"));
     }
-    // Se downloadError foi true, a mensagem de erro específica já foi enviada.
-    // Limpar qualquer lixo restante na serial do sensor
-    delay(50); // Dá um tempo para o sensor terminar de enviar, se for o caso
-    while(mySensorSerial.available()) mySensorSerial.read();
+
+    unsigned long finalCleanupStartTime = millis();
+    while (millis() - finalCleanupStartTime < 500) { // Dê 500ms para o sensor "calar a boca"
+      if (mySensorSerial.available()) {
+          mySensorSerial.read(); // Descarta
+      }
+      delay(10); // Pequenas pausas para não bloquear totalmente
+    }
+    inputString = "";
+    stringComplete = false;
+    Serial.flush();
+
 }

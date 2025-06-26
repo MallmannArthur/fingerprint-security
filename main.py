@@ -309,50 +309,111 @@ def enroll_finger_interactive():
             if RESP_OK in ack_response and "TEMPLATE_UPLOAD_CMD_ACKNOWLEDGED" in ack_response:
                 print("Arduino confirmou início da transferência do template...")
                 
-                while True: # Loop para os chunks e mensagem final
-                    arduino_reply = read_arduino_response(timeout_seconds=10) # Timeout para cada chunk/msg final
+                received_all_expected = False # Flag para indicar se o download foi OK
+                while not received_all_expected: # Loop até fim ou erro claro
+                    arduino_reply = read_arduino_response(timeout_seconds=15) # Timeout um pouco maior
 
                     if arduino_reply.startswith("TEMPLATE_CHUNK:"):
                         hex_chunk = arduino_reply.split(":", 1)[1]
                         template_hex_parts.append(hex_chunk)
-                        # print(f"   Recebido chunk: {len(hex_chunk)//2} bytes")
+                    elif arduino_reply.startswith("DBG:"):
+                        print(f"ARDUINO DEBUG: {arduino_reply[4:]}")
+                        # Apenas loga, continua esperando o próximo pacote de dados ou finalização
                     elif RESP_OK in arduino_reply and "TEMPLATE_DOWNLOAD_COMPLETE" in arduino_reply:
                         try:
                             bytes_downloaded_count_from_arduino = int(arduino_reply.split(":")[-1])
                             print(f"Arduino reportou download completo: {bytes_downloaded_count_from_arduino} bytes.")
                             full_hex_string = "".join(template_hex_parts)
                             full_template_bytes = bytes.fromhex(full_hex_string)
-                            if len(full_template_bytes) == bytes_downloaded_count_from_arduino:
+                            
+                            # TEMPLATE_SIZE é 512 bytes.
+                            # Cada chunk tem 128 bytes (DATA_PACKET_PAYLOAD_SIZE no Arduino)
+                            # Então esperamos 512 / 128 = 4 chunks.
+                            expected_template_size = 512 # Defina isso no Python
+                            if len(full_template_bytes) == expected_template_size and \
+                            bytes_downloaded_count_from_arduino == expected_template_size:
                                 print(f"Template reconstruído com sucesso ({len(full_template_bytes)} bytes).")
                                 transfer_successful = True
                             else:
-                                print(f"ERRO: Discrepância no tamanho! Python reconstruiu {len(full_template_bytes)}, Arduino reportou {bytes_downloaded_count_from_arduino}")
+                                print(f"ERRO: Discrepância no tamanho! Python reconstruiu {len(full_template_bytes)} (esperava {expected_template_size}), Arduino reportou {bytes_downloaded_count_from_arduino}")
                         except ValueError as e:
                             print(f"Erro ao converter template de HEX para bytes: {e}")
                         except Exception as e:
                             print(f"Erro inesperado ao finalizar template: {e}")
-                        break # Sai do loop de chunks
-                    elif RESP_FAIL in arduino_reply:
-                        print(f"Falha no download do template reportada pelo Arduino: {arduino_reply}")
-                        break # Sai do loop de chunks
-                    elif "TIMEOUT_PY" in arduino_reply:
-                        print("Timeout esperando mais dados do template do Arduino.")
-                        break # Sai do loop de chunks
+                        received_all_expected = True # Sai do loop while
+                    elif RESP_FAIL in arduino_reply: # Uma falha explícita do Arduino durante a transferência
+                        print(f"Falha na transferência do template reportada pelo Arduino: {arduino_reply}")
+                        received_all_expected = True # Sai do loop while
+                        transfer_successful = False
+                    elif f"{RESP_FAIL}:TIMEOUT_PY" in arduino_reply: # Timeout do read_arduino_response
+                        print("Timeout geral esperando dados/fim do template do Arduino.")
+                        received_all_expected = True # Sai do loop while
+                        transfer_successful = False
                     else:
                         print(f"Resposta inesperada durante download do template: {arduino_reply}")
-                        # Continuar esperando pode ser arriscado aqui
-            else:
-                print(f"Arduino não confirmou o início do download do template. Resposta: {ack_response}")
-            
-            if transfer_successful and full_template_bytes:
-                print(f"Template ({len(full_template_bytes)} bytes) pronto para ser salvo no banco de dados.")
-                # Aqui você chamaria sua função para salvar no banco de dados:
-                # db_save_template(user_id, full_template_bytes)
-                print(f"Template para ID {user_id} salvo externamente!")
-            else:
-                print("Download do template falhou ou template inválido.")
+                        # Aqui pode ser um problema, talvez quebrar o loop ou ter um contador de erros
+            # ... (resto da lógica para salvar se transfer_successful) ...
         else:
             print("Falha ao enviar comando de download para o Arduino.")
+        # print("Solicitando download do template do sensor (MODO DUMP BRUTO)...")
+        # if send_to_arduino(CMD_DOWNLOAD_TEMPLATE_B1):
+        #     raw_dump_hex = ""
+        #     bytes_dumped_count = 0
+        #     dump_successful = False
+        #     DUMP_TIMEOUT=5000
+
+        #     # Esperar o ACK do modo dump
+        #     ack_response = read_arduino_response(timeout_seconds=5)
+        #     if RESP_OK in ack_response and "TEMPLATE_UPLOAD_CMD_ACKNOWLEDGED_RAW_DUMP_MODE" in ack_response:
+        #         print("Arduino confirmou início do DUMP BRUTO...")
+
+        #         # Esperar a mensagem RAW_DUMP:
+        #         dump_data_response = read_arduino_response(timeout_seconds=DUMP_TIMEOUT + 2) # Timeout maior
+        #         if dump_data_response.startswith("RAW_DUMP:"):
+        #             raw_dump_hex = dump_data_response.split(":", 1)[1]
+        #             print(f"--- INÍCIO DUMP BRUTO (HEX) --- ({len(raw_dump_hex)} chars, {len(raw_dump_hex)//2} bytes aprox.)")
+        #             # Imprimir em linhas para facilitar a leitura
+        #             for i in range(0, len(raw_dump_hex), 64): # Imprime 32 bytes (64 chars hex) por linha
+        #                 print(raw_dump_hex[i:i+64])
+        #             print("--- FIM DUMP BRUTO ---")
+
+        #             # Esperar a confirmação de conclusão do dump
+        #             final_response = read_arduino_response(timeout_seconds=5)
+        #             if RESP_OK in final_response and "RAW_DUMP_COMPLETE" in final_response:
+        #                 try:
+        #                     bytes_dumped_count = int(final_response.split(":")[-1])
+        #                     print(f"Arduino reportou DUMP completo: {bytes_dumped_count} bytes lidos do sensor.")
+        #                     if bytes_dumped_count > 0 and len(raw_dump_hex) == bytes_dumped_count * 2:
+        #                         dump_successful = True
+        #                     elif bytes_dumped_count == 0:
+        #                         print("Arduino não conseguiu dumpar nenhum byte do sensor.")
+        #                     else:
+        #                         print(f"Discrepância no tamanho do dump: HEX chars={len(raw_dump_hex)}, Arduino bytes={bytes_dumped_count}")
+
+        #                 except Exception as e:
+        #                     print(f"Erro ao processar confirmação do dump: {e}")
+        #             else:
+        #                 print(f"Não houve confirmação de conclusão do dump: {final_response}")
+        #         elif RESP_FAIL in dump_data_response:
+        #              print(f"Falha no dump reportada pelo Arduino: {dump_data_response}")
+        #         else:
+        #             print(f"Resposta inesperada ao esperar RAW_DUMP: {dump_data_response}")
+        #     else:
+        #         print(f"Arduino não confirmou o início do MODO DUMP. Resposta: {ack_response}")
+
+        #     if dump_successful:
+        #         print("\nAnálise do DUMP BRUTO:")
+        #         print("Procure por sequências EF01 (início de pacote).")
+        #         print("Após EF01 FFFFFFFF (endereço), o 7º byte é o PID (01 cmd, 02 data, 07 ack, 08 enddata).")
+        #         print("Os 2 bytes seguintes são o Packet Length (High, Low).")
+        #         print("Depois vem o Payload, e os 2 últimos bytes do pacote ANTES do próximo EF01 são o Checksum.")
+        #         print("Tente decodificar manualmente um pacote completo e verificar o checksum.")
+        #         # Aqui você poderia adicionar código Python para tentar decodificar o raw_dump_hex
+        #         # e verificar os checksums no lado do Python.
+        #     else:
+        #         print("DUMP BRUTO falhou ou não produziu dados úteis.")
+        # else:
+        #     print("Falha ao enviar comando de download para o Arduino.")
 
     # 8. Arduino armazena modelo (Python envia comando para armazenar)
     choice_store_sensor = input(f"Deseja armazenar este modelo no flash do sensor com ID {user_id}? (S/n): ").strip().lower()
